@@ -2,12 +2,11 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::random;
-
-use crate::io::Protocol;
-use crate::io::{DatagramRecv, Receive, Transmit, DATAGRAM_MTU};
 use crate::io::{Id, DATAGRAM_MTU_WARN};
+use crate::io::{Protocol, StunPacket};
 use crate::io::{StunMessage, TransId, STUN_TIMEOUT};
+use crate::io::{Transmit, DATAGRAM_MTU};
+use crate::util::NonCryptographicRng;
 
 use super::candidate::{Candidate, CandidateKind};
 use super::pair::{CandidatePair, CheckState, PairId};
@@ -18,6 +17,10 @@ use super::pair::{CandidatePair, CheckState, PairId};
 /// value based on the characteristics of the associated data.
 const TIMING_ADVANCE: Duration = Duration::from_millis(50);
 
+/// Handles the ICE protocol for a given peer.
+///
+/// Each connection between two peers corresponds to one [`IceAgent`] on either end.
+/// To form connections to multiple peers, a peer needs to create a dedicated [`IceAgent`] for each one.
 #[derive(Debug)]
 pub struct IceAgent {
     /// Last time handle_timeout run (paced by timing_advance).
@@ -196,7 +199,7 @@ pub enum IceAgentEvent {
     ///
     /// For each ICE restart, the app will only receive unique addresses once.
     DiscoveredRecv {
-        // The protocol to use for the socket.
+        /// The protocol to use for the socket.
         proto: Protocol,
         /// The remote socket to look out for.
         source: SocketAddr,
@@ -208,7 +211,7 @@ pub enum IceAgentEvent {
     /// requiring an ICE restart. The application should always use the values
     /// of the last emitted event to send data.
     NominatedSend {
-        // The protocol to use for the socket.
+        /// The protocol to use for the socket.
         proto: Protocol,
         /// The local socket address to send datagrams from.
         ///
@@ -236,11 +239,13 @@ impl IceCreds {
 }
 
 impl IceAgent {
+    /// Create a new [`IceAgent`] with randomly generated credentials.
     #[allow(unused)]
     pub fn new() -> Self {
         Self::with_local_credentials(IceCreds::new())
     }
 
+    /// Create a new [`IceAgent`] with a specific set of credentials.
     pub fn with_local_credentials(local_credentials: IceCreds) -> Self {
         IceAgent {
             last_now: None,
@@ -249,7 +254,7 @@ impl IceAgent {
             local_credentials,
             remote_credentials: None,
             controlling: false,
-            control_tie_breaker: random(),
+            control_tie_breaker: NonCryptographicRng::u64(),
             state: IceConnectionState::New,
             local_candidates: vec![],
             remote_candidates: vec![],
@@ -288,6 +293,11 @@ impl IceAgent {
     /// The candidates have their ufrag filled out to the local credentials.
     pub fn local_candidates(&self) -> &[Candidate] {
         &self.local_candidates
+    }
+
+    /// Remote ice candidates.
+    pub fn remote_candidates(&self) -> &[Candidate] {
+        &self.remote_candidates
     }
 
     /// Sets the remote ice credentials.
@@ -775,6 +785,18 @@ impl IceAgent {
             }
         }
 
+        if message.is_successful_binding_response() {
+            let belongs_to_a_candidate_pair = self
+                .candidate_pairs
+                .iter()
+                .any(|pair| pair.has_binding_attempt(message.trans_id()));
+
+            if !belongs_to_a_candidate_pair {
+                trace!("Message rejected, transaction ID does not belong to any of our candidate pairs");
+                return false;
+            }
+        }
+
         let (_, password) = self.stun_credentials(!message.is_response());
         if !message.check_integrity(&password) {
             trace!("Message rejected, integrity check failed");
@@ -788,38 +810,34 @@ impl IceAgent {
     /// Handles an incoming STUN message.
     ///
     /// Will not be used if [`IceAgent::accepts_message`] returns false.
-    pub fn handle_receive(&mut self, now: Instant, r: Receive) {
-        trace!("Handle receive: {:?}", r);
-
-        let message = match r.contents {
-            DatagramRecv::Stun(v) => v,
-            _ => {
-                trace!("Receive rejected, not STUN");
-                return;
-            }
-        };
+    pub fn handle_packet(&mut self, now: Instant, packet: StunPacket) {
+        trace!("Handle receive: {:?}", &packet.message);
 
         // Regardless of whether we have remote_creds at this point, we can
         // at least check the message integrity.
-        if !self.accepts_message(&message) {
+        if !self.accepts_message(&packet.message) {
             debug!("Message not accepted");
             return;
         }
 
-        if message.is_binding_request() {
-            self.stun_server_handle_message(now, r.proto, r.source, r.destination, message);
-        } else if message.is_successful_binding_response() {
-            self.stun_client_handle_response(now, message);
+        if packet.message.is_binding_request() {
+            self.stun_server_handle_message(now, &packet);
+        } else if packet.message.is_successful_binding_response() {
+            self.stun_client_handle_response(now, packet.message);
         }
 
         self.emit_event(IceAgentEvent::DiscoveredRecv {
-            proto: r.proto,
-            source: r.source,
+            proto: packet.proto,
+            source: packet.source,
         });
 
         // TODO handle unsuccessful responses.
     }
 
+    /// Provide the current time to the [`IceAgent`].
+    ///
+    /// Typically, you will want to call [`IceAgent::poll_timeout`] and "wake-up" the agent once that time is reached.
+    /// It is save to call this function more often as the agent will internally only operate in steps of at most 50ms (`TIMING_ADVANCE`).
     pub fn handle_timeout(&mut self, now: Instant) {
         // The generation of ordinary and triggered connectivity checks is
         // governed by timer Ta.
@@ -989,6 +1007,7 @@ impl IceAgent {
         self.events.push_back(event);
     }
 
+    /// Return a pending [`IceAgentEvent`] from this agent.
     pub fn poll_event(&mut self) -> Option<IceAgentEvent> {
         let x = self.events.pop_front();
         if x.is_some() {
@@ -997,14 +1016,8 @@ impl IceAgent {
         x
     }
 
-    fn stun_server_handle_message(
-        &mut self,
-        now: Instant,
-        proto: Protocol,
-        source: SocketAddr,
-        destination: SocketAddr,
-        message: StunMessage,
-    ) {
+    fn stun_server_handle_message(&mut self, now: Instant, packet: &StunPacket) {
+        let message = &packet.message;
         let prio = message
             .prio()
             // this should be guarded in the parsing
@@ -1024,9 +1037,9 @@ impl IceAgent {
         // credentials, we extract all relevant bits of information so it can be owned.
         let req = StunRequest {
             now,
-            proto,
-            source,
-            destination,
+            proto: packet.proto,
+            source: packet.source,
+            destination: packet.destination,
             trans_id,
             prio,
             use_candidate,
@@ -1780,5 +1793,42 @@ mod test {
                 assert!(s != IceConnectionState::Disconnected);
             }
         }
+    }
+
+    #[test]
+    fn does_not_accept_response_with_unknown_transaction_id() {
+        let mut agent = IceAgent::new();
+        let remote_creds = IceCreds::new();
+        let mut remote_candidate = Candidate::host(ipv4_3(), "udp").unwrap();
+        remote_candidate.set_ufrag(&remote_creds.ufrag);
+
+        agent.set_remote_credentials(remote_creds.clone());
+        agent.add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap());
+        agent.add_remote_candidate(remote_candidate);
+        agent.handle_timeout(Instant::now());
+
+        let payload = Vec::from(agent.poll_transmit().unwrap().contents);
+        let stun_message = StunMessage::parse(&payload).unwrap();
+
+        let valid_reply =
+            make_authenticated_stun_reply(stun_message.trans_id(), ipv4_4(), &remote_creds.pass);
+        let fake_reply =
+            make_authenticated_stun_reply(TransId::new(), ipv4_4(), &remote_creds.pass);
+
+        assert!(!agent.accepts_message(&StunMessage::parse(&fake_reply).unwrap()));
+        assert!(agent.accepts_message(&StunMessage::parse(&valid_reply).unwrap()));
+    }
+
+    fn make_authenticated_stun_reply(tx_id: TransId, addr: SocketAddr, password: &str) -> Vec<u8> {
+        let reply = StunMessage::reply(tx_id, addr);
+
+        let mut buf = vec![0_u8; DATAGRAM_MTU];
+
+        let n = reply
+            .to_bytes(password, &mut buf)
+            .expect("IO error writing STUN reply");
+        buf.truncate(n);
+
+        buf
     }
 }

@@ -6,7 +6,6 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use pcap_file::pcap::PcapReader;
-use rand::Rng;
 use str0m::change::SdpApi;
 use str0m::format::Codec;
 use str0m::format::PayloadParams;
@@ -62,6 +61,22 @@ impl TestRtc {
             .cloned()
             .unwrap()
     }
+
+    pub fn params_vp9(&self) -> PayloadParams {
+        self.rtc
+            .codec_config()
+            .find(|p| p.spec().codec == Codec::Vp9)
+            .cloned()
+            .unwrap()
+    }
+
+    pub fn params_h264(&self) -> PayloadParams {
+        self.rtc
+            .codec_config()
+            .find(|p| p.spec().codec == Codec::H264)
+            .cloned()
+            .unwrap()
+    }
 }
 
 pub fn progress(l: &mut TestRtc, r: &mut TestRtc) -> Result<(), RtcError> {
@@ -101,7 +116,6 @@ pub fn progress(l: &mut TestRtc, r: &mut TestRtc) -> Result<(), RtcError> {
 
 pub fn progress_with_loss(l: &mut TestRtc, r: &mut TestRtc, loss: f32) -> Result<(), RtcError> {
     let (f, t) = if l.last < r.last { (l, r) } else { (r, l) };
-    let mut rng = rand::thread_rng();
 
     loop {
         f.span
@@ -114,7 +128,7 @@ pub fn progress_with_loss(l: &mut TestRtc, r: &mut TestRtc, loss: f32) -> Result
                 break;
             }
             Output::Transmit(v) => {
-                if rng.gen::<f32>() <= loss {
+                if fastrand::f32() <= loss {
                     // LOSS !
                     break;
                 }
@@ -258,9 +272,27 @@ pub fn connect_l_r() -> (TestRtc, TestRtc) {
     (l, r)
 }
 
-pub fn vp8_data() -> Vec<(Duration, RtpHeader, Vec<u8>)> {
-    let reader = Cursor::new(include_bytes!("data/vp8.pcap"));
-    let mut r = PcapReader::new(reader).expect("vp8 pcap reader");
+pub type PcapData = Vec<(Duration, RtpHeader, Vec<u8>)>;
+
+pub fn vp8_data() -> PcapData {
+    load_pcap_data(include_bytes!("data/vp8.pcap"))
+}
+
+pub fn vp9_contiguous_data() -> PcapData {
+    load_pcap_data(include_bytes!("data/contiguous_vp9.pcap"))
+}
+
+pub fn vp9_data() -> PcapData {
+    load_pcap_data(include_bytes!("data/vp9.pcap"))
+}
+
+pub fn h264_data() -> PcapData {
+    load_pcap_data(include_bytes!("data/h264.pcap"))
+}
+
+pub fn load_pcap_data(data: &[u8]) -> PcapData {
+    let reader = Cursor::new(data);
+    let mut r = PcapReader::new(reader).expect("pcap reader");
 
     let exts = ExtensionMap::standard();
 
@@ -279,7 +311,7 @@ pub fn vp8_data() -> Vec<(Duration, RtpHeader, Vec<u8>)> {
         // This magic number 42 is the ethernet/IP/UDP framing of the packet.
         let rtp_data = &pkt.data[42..];
 
-        let header = RtpHeader::parse(rtp_data, &exts).unwrap();
+        let header = RtpHeader::_parse(rtp_data, &exts).unwrap();
         let payload = &rtp_data[header.header_len..];
 
         ret.push((relative_time, header, payload.to_vec()));

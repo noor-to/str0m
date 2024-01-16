@@ -11,7 +11,7 @@ use crate::sdp::FormatParam;
 
 // These really don't belong anywhere, but I guess they're kind of related
 // to codecs etc.
-pub use crate::packet::{CodecExtra, Vp8CodecExtra, Vp9CodecExtra};
+pub use crate::packet::{CodecExtra, H264CodecExtra, Vp8CodecExtra, Vp9CodecExtra};
 
 /// Session config for all codecs.
 #[derive(Debug, Clone, Default)]
@@ -389,12 +389,6 @@ impl PayloadParams {
                 claimed.assert_claim_once(rtx);
             }
         }
-    }
-
-    /// Exposed for integration tests.
-    #[doc(hidden)]
-    pub fn is_locked(&self) -> bool {
-        self.locked
     }
 }
 
@@ -842,7 +836,7 @@ impl Codec {
     /// Tells if codec is video.
     pub fn is_video(&self) -> bool {
         use Codec::*;
-        matches!(self, H264 | Vp8 | Vp9 | Av1)
+        matches!(self, H265 | H264 | Vp8 | Vp9 | Av1)
     }
 
     /// Audio/Video.

@@ -575,6 +575,7 @@
 #![allow(clippy::bool_to_int_with_if)]
 #![allow(clippy::assertions_on_constants)]
 #![allow(clippy::manual_range_contains)]
+#![allow(clippy::get_first)]
 #![deny(missing_docs)]
 
 #[macro_use]
@@ -582,6 +583,7 @@ extern crate tracing;
 
 use bwe::{Bwe, BweKind};
 use change::{DirectApi, SdpApi};
+use ice::IceCreds;
 use rtp::RawPacket;
 use std::fmt;
 use std::net::SocketAddr;
@@ -596,14 +598,26 @@ use dtls::DtlsCert;
 use dtls::Fingerprint;
 use dtls::{Dtls, DtlsEvent};
 
-mod ice;
-use ice::IceAgent;
-use ice::IceAgentEvent;
-use ice::IceCreds;
-pub use ice::{Candidate, CandidateKind};
+#[path = "ice/mod.rs"]
+mod ice_;
+use ice_::IceAgent;
+use ice_::IceAgentEvent;
+pub use ice_::{Candidate, CandidateKind, IceConnectionState};
+
+/// Low level ICE access.
+// The ICE API is not necessary to interact with directly for "regular"
+// use of str0m. This is exported for other libraries that want to
+// reuse str0m's ICE implementation. In the future we might turn this
+// into a separate crate.
+#[doc(hidden)]
+pub mod ice {
+    pub use crate::ice_::IceCreds;
+    pub use crate::ice_::{IceAgent, IceAgentEvent};
+    pub use crate::io::StunMessage;
+}
 
 mod io;
-use io::DatagramRecv;
+use io::DatagramRecvInner;
 
 mod packet;
 
@@ -659,8 +673,6 @@ mod sdp;
 pub mod format;
 use format::CodecConfig;
 
-pub use ice::IceConnectionState;
-
 pub mod channel;
 use channel::{Channel, ChannelData, ChannelHandler, ChannelId};
 
@@ -690,7 +702,7 @@ pub mod net {
 /// Various error types.
 pub mod error {
     pub use crate::dtls::DtlsError;
-    pub use crate::ice::IceError;
+    pub use crate::ice_::IceError;
     pub use crate::io::NetError;
     pub use crate::packet::PacketError;
     pub use crate::rtp_::RtpError;
@@ -931,10 +943,6 @@ pub enum Event {
     /// This clones data, and is therefore expensive.
     /// Should not be enabled outside of tests and troubleshooting.
     RawPacket(Box<RawPacket>),
-
-    /// Internal for passing data from Session to Rtc.
-    #[doc(hidden)]
-    Error(RtcError),
 }
 
 impl Event {
@@ -950,6 +958,7 @@ impl Event {
 
 /// Input as expected by [`Rtc::handle_input()`]. Either network data or a timeout.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // We purposely don't want to allocate.
 pub enum Input<'a> {
     /// A timeout without any network input.
     Timeout(Instant),
@@ -1389,11 +1398,12 @@ impl Rtc {
         }
 
         if let Some(ev) = self.session.poll_event() {
-            if let Event::Error(err) = ev {
-                return Err(err);
-            } else {
-                return Ok(Output::Event(ev));
-            }
+            return Ok(Output::Event(ev));
+        }
+
+        // Some polling needs to bubble up errors.
+        if let Some(ev) = self.session.poll_event_fallible()? {
+            return Ok(Output::Event(ev));
         }
 
         if let Some(e) = self.stats.as_mut().and_then(|s| s.poll_output()) {
@@ -1493,7 +1503,7 @@ impl Rtc {
 
         // STUN can use the ufrag/password to identify that a message belongs
         // to this Rtc instance.
-        if let DatagramRecv::Stun(v) = &r.contents {
+        if let DatagramRecvInner::Stun(v) = &r.contents.inner {
             return self.ice.accepts_message(v);
         }
 
@@ -1572,9 +1582,9 @@ impl Rtc {
 
         trace!("IN {:?}", r);
         self.last_now = now;
-        use net::DatagramRecv::*;
+        use DatagramRecvInner::*;
 
-        let bytes_rx = match r.contents {
+        let bytes_rx = match r.contents.inner {
             // TODO: stun is already parsed (depacketized) here
             Stun(_) => 0,
             Dtls(v) | Rtp(v) | Rtcp(v) => v.len(),
@@ -1582,10 +1592,19 @@ impl Rtc {
 
         self.peer_bytes_rx += bytes_rx as u64;
 
-        match r.contents {
-            Stun(_) => self.ice.handle_receive(now, r),
-            Dtls(_) => self.dtls.handle_receive(r)?,
-            Rtp(_) | Rtcp(_) => self.session.handle_receive(now, r),
+        match r.contents.inner {
+            Stun(stun) => self.ice.handle_packet(
+                now,
+                io::StunPacket {
+                    proto: r.proto,
+                    source: r.source,
+                    destination: r.destination,
+                    message: stun,
+                },
+            ),
+            Dtls(dtls) => self.dtls.handle_receive(dtls)?,
+            Rtp(rtp) => self.session.handle_rtp_receive(now, rtp),
+            Rtcp(rtcp) => self.session.handle_rtcp_receive(now, rtcp),
         }
 
         Ok(())
@@ -1644,24 +1663,6 @@ impl Rtc {
     pub fn codec_config(&self) -> &CodecConfig {
         &self.session.codec_config
     }
-
-    /// All media mids (not application). For integration tests.
-    #[doc(hidden)]
-    pub fn mids(&self) -> Vec<Mid> {
-        self.session.medias.iter().map(Media::mid).collect()
-    }
-
-    /// All current RTP header extensions. For integration tests.
-    #[doc(hidden)]
-    pub fn exts(&self) -> &ExtensionMap {
-        &self.session.exts
-    }
-
-    /// Current local ICE credentials. For integration tests.
-    #[doc(hidden)]
-    pub fn local_ice_creds(&self) -> IceCreds {
-        self.ice.local_credentials().clone()
-    }
 }
 
 /// Customized config for creating an [`Rtc`] instance.
@@ -1701,6 +1702,7 @@ impl RtcConfig {
     }
 
     /// The auto generated local ice credentials.
+    #[cfg_attr(not(feature = "ice-agent"), doc(hidden))]
     pub fn local_ice_credentials(&self) -> &IceCreds {
         &self.local_ice_credentials
     }
@@ -1713,8 +1715,7 @@ impl RtcConfig {
     /// DTLS fingerprint.
     ///
     /// ```
-    /// use str0m::RtcConfig;
-    ///
+    /// # use str0m::RtcConfig;
     /// let fingerprint = RtcConfig::default()
     ///     .build()
     ///     .direct_api()
@@ -1730,9 +1731,8 @@ impl RtcConfig {
     /// Use this API to reuse a previously created [`DtlsCert`] if available.
     ///
     /// ```
-    /// use str0m::RtcConfig;
-    /// use str0m::change::DtlsCert;
-    ///
+    /// # use str0m::RtcConfig;
+    /// # use str0m::change::DtlsCert;
     /// let dtls_cert = DtlsCert::new();
     ///
     /// let rtc_config = RtcConfig::default()
@@ -1758,10 +1758,11 @@ impl RtcConfig {
     /// Get fingerprint verification mode.
     ///
     /// ```
-    /// # use str0m::RtcConfig;
+    /// # use str0m::Rtc;
+    /// let config = Rtc::builder();
     ///
-    /// // Verify that fingerprint verification is enabled by default.
-    /// assert!(RtcConfig::default().fingerprint_verification());
+    /// // Defaults to true.
+    /// assert!(config.fingerprint_verification());
     /// ```
     pub fn fingerprint_verification(&self) -> bool {
         self.fingerprint_verification
@@ -1797,7 +1798,6 @@ impl RtcConfig {
     ///
     /// ```
     /// # use str0m::RtcConfig;
-    ///
     /// // For the session to use only OPUS and VP8.
     /// let mut rtc = RtcConfig::default()
     ///     .clear_codecs()
@@ -1870,6 +1870,12 @@ impl RtcConfig {
     /// ```
     pub fn extension_map(&mut self) -> &mut ExtensionMap {
         &mut self.exts
+    }
+
+    /// Set the extension map replacing the existing.
+    pub fn set_extension_map(mut self, exts: ExtensionMap) -> Self {
+        self.exts = exts;
+        self
     }
 
     /// Clear out the standard extension mappings.
@@ -2015,6 +2021,8 @@ impl RtcConfig {
     /// fits in one. If you can guarantee that every `write()` is a single RTP packet, and is always
     /// followed by a `poll_output()`, it might be possible to set this value to 1. But that would give
     /// no margins for unexpected patterns.
+    ///
+    /// panics if set to 0.
     pub fn set_send_buffer_audio(mut self, size: usize) -> Self {
         assert!(size > 0);
         self.send_buffer_audio = size;
@@ -2208,13 +2216,10 @@ mod test {
     #[test]
     fn event_is_reasonably_sized() {
         let n = std::mem::size_of::<Event>();
-        println!("{:?}", n);
         assert!(n < 450);
     }
 }
 
-#[cfg(fuzzing)]
+#[cfg(feature = "_internal_test_exports")]
 #[allow(missing_docs)]
-pub mod fuzz {
-    pub use crate::streams::rtx_cache_buf::EvictingBuffer;
-}
+pub mod _internal_test_exports;

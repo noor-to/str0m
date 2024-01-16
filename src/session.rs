@@ -265,30 +265,20 @@ impl Session {
         Some(())
     }
 
-    pub fn handle_receive(&mut self, now: Instant, r: net::Receive) {
-        self.do_handle_receive(now, r);
+    pub fn handle_rtp_receive(&mut self, now: Instant, message: &[u8]) {
+        let Some(header) = RtpHeader::parse(message, &self.exts) else {
+            trace!("Failed to parse RTP header");
+            return;
+        };
+
+        self.handle_rtp(now, header, message);
     }
 
-    fn do_handle_receive(&mut self, now: Instant, r: net::Receive) -> Option<()> {
-        use crate::io::DatagramRecv::*;
-        match r.contents {
-            Rtp(buf) => {
-                if let Some(header) = RtpHeader::parse(buf, &self.exts) {
-                    self.handle_rtp(now, header, buf);
-                } else {
-                    trace!("Failed to parse RTP header");
-                }
-            }
-            Rtcp(buf) => {
-                // According to spec, the outer enclosing SRTCP packet should always be a SR or RR,
-                // even if it's irrelevant and empty.
-                // In practice I'm not sure that is happening, because libWebRTC hates empty packets.
-                self.handle_rtcp(now, buf)?;
-            }
-            _ => {}
-        }
-
-        Some(())
+    pub fn handle_rtcp_receive(&mut self, now: Instant, message: &[u8]) {
+        // According to spec, the outer enclosing SRTCP packet should always be a SR or RR,
+        // even if it's irrelevant and empty.
+        // In practice I'm not sure that is happening, because libWebRTC hates empty packets.
+        self.handle_rtcp(now, message);
     }
 
     fn mid_and_ssrc_for_header(&mut self, header: &RtpHeader) -> Option<(Mid, Ssrc)> {
@@ -351,7 +341,7 @@ impl Session {
         }
     }
 
-    fn handle_rtp(&mut self, now: Instant, mut header: RtpHeader, buf: &[u8]) {
+    pub(crate) fn handle_rtp(&mut self, now: Instant, mut header: RtpHeader, buf: &[u8]) {
         // Rewrite absolute-send-time (if present) to be relative to now.
         header.ext_vals.update_absolute_send_time(now);
 
@@ -541,8 +531,10 @@ impl Session {
             return Some(Event::StreamPaused(paused));
         }
 
-        if let Some(packet) = self.pending_packet.take() {
-            return Some(Event::RtpPacket(packet));
+        if self.rtp_mode {
+            if let Some(packet) = self.pending_packet.take() {
+                return Some(Event::RtpPacket(packet));
+            }
         }
 
         if let Some(req) = self.streams.poll_keyframe_request() {
@@ -572,16 +564,24 @@ impl Session {
                     direction: media.direction(),
                 }));
             }
-
-            if let Some(r) = media.poll_sample(&self.codec_config) {
-                match r {
-                    Ok(v) => return Some(Event::MediaData(v)),
-                    Err(e) => return Some(Event::Error(e)),
-                }
-            }
         }
 
         None
+    }
+
+    pub fn poll_event_fallible(&mut self) -> Result<Option<Event>, RtcError> {
+        // Not relevant in rtp_mode, where the packets are picked up by poll_event().
+        if self.rtp_mode {
+            return Ok(None);
+        }
+
+        for media in &mut self.medias {
+            if let Some(e) = media.poll_sample(&self.codec_config)? {
+                return Ok(Some(Event::MediaData(e)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn ready_for_srtp(&self) -> bool {
@@ -741,6 +741,10 @@ impl Session {
     }
 
     fn nack_at(&mut self) -> Instant {
+        if !self.streams.any_nack_enabled() {
+            return not_happening();
+        }
+
         self.last_nack + NACK_MIN_INTERVAL
     }
 

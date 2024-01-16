@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use crate::rtp_::{ExtensionValues, MediaTime, RtpHeader, SenderInfo, SeqNo};
 
-use super::vp8_contiguity::Vp8Contiguity;
+use super::contiguity::{self, Contiguity};
+use super::contiguity_vp8::Vp8Contiguity;
+use super::contiguity_vp9::Vp9Contiguity;
 use super::{CodecDepacketizer, CodecExtra, Depacketizer, PacketError, Vp8CodecExtra};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -82,11 +84,21 @@ pub struct DepacketizingBuffer {
     last_emitted: Option<(SeqNo, CodecExtra)>,
     max_time: Option<MediaTime>,
     depack_cache: Option<(Range<usize>, Depacketized)>,
-    vp8_contiguity: Vp8Contiguity,
+    contiguity: Contiguity,
 }
 
 impl DepacketizingBuffer {
     pub(crate) fn new(depack: CodecDepacketizer, hold_back: usize) -> Self {
+        let contiguity = match depack {
+            CodecDepacketizer::Vp8(_) => Contiguity::Vp8(Vp8Contiguity::new()),
+            CodecDepacketizer::Vp9(_) => Contiguity::Vp9(Vp9Contiguity::new()),
+            CodecDepacketizer::H264(_)
+            | CodecDepacketizer::H265(_)
+            | CodecDepacketizer::Boxed(_)
+            | CodecDepacketizer::Opus(_)
+            | CodecDepacketizer::Null(_) => Contiguity::None,
+        };
+
         DepacketizingBuffer {
             hold_back,
             depack,
@@ -95,7 +107,7 @@ impl DepacketizingBuffer {
             last_emitted: None,
             max_time: None,
             depack_cache: None,
-            vp8_contiguity: Vp8Contiguity::new(),
+            contiguity,
         }
     }
 
@@ -185,12 +197,7 @@ impl DepacketizingBuffer {
             return None;
         }
 
-        let (can_emit, contiguous_codec) = match dep.codec_extra {
-            CodecExtra::Vp8(next) => self.vp8_contiguity.check(&next, contiguous_seq),
-            CodecExtra::Vp9(_) => (true, contiguous_seq),
-            CodecExtra::None => (true, contiguous_seq),
-        };
-
+        let (can_emit, contiguous_codec) = self.contiguity.check(&dep.codec_extra, contiguous_seq);
         dep.contiguous = contiguous_codec;
 
         let last = self
@@ -233,13 +240,8 @@ impl DepacketizingBuffer {
         let mut meta = Vec::with_capacity(stop - start + 1);
 
         for entry in self.queue.range_mut(start..=stop) {
-            if let Err(e) = self
-                .depack
-                .depacketize(&entry.data, &mut data, &mut codec_extra)
-            {
-                println!("depacketize error: {} {}", start, stop);
-                return Err(e);
-            }
+            self.depack
+                .depacketize(&entry.data, &mut data, &mut codec_extra)?;
             meta.push(entry.meta.clone());
         }
 
@@ -267,7 +269,7 @@ impl DepacketizingBuffer {
         for (index, entry) in self.queue.iter().enumerate() {
             let index = index as i64;
             let iseq = *entry.meta.seq_no as i64;
-            let expected_seq = start.map(|s| s.offset + index);
+            let expected_seq = start.map(|s| s.offset.saturating_add(index));
 
             let is_expected_seq = expected_seq == Some(iseq);
             let is_same_timestamp = start.map(|s| s.time) == Some(entry.meta.time);
@@ -292,7 +294,7 @@ impl DepacketizingBuffer {
                 start = Some(Start {
                     index,
                     time: entry.meta.time,
-                    offset: iseq - index,
+                    offset: iseq.saturating_sub(index),
                 });
             }
 

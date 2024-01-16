@@ -390,7 +390,8 @@ impl Candidate {
         self.raddr
     }
 
-    pub(crate) fn kind(&self) -> CandidateKind {
+    /// Returns the kind of this candidate.
+    pub fn kind(&self) -> CandidateKind {
         self.kind
     }
 
@@ -410,8 +411,7 @@ impl Candidate {
         self.ufrag = Some(ufrag.into());
     }
 
-    #[doc(hidden)]
-    pub fn ufrag(&self) -> Option<&str> {
+    pub(crate) fn ufrag(&self) -> Option<&str> {
         self.ufrag.as_deref()
     }
 

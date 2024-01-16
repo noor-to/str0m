@@ -11,14 +11,14 @@ use crate::rtp_::{Bitrate, Pt};
 use crate::rtp_::{MediaTime, SenderInfo};
 use crate::rtp_::{Mid, Rid, SeqNo};
 use crate::rtp_::{Rtcp, RtpHeader};
-use crate::util::already_happened;
+use crate::util::{already_happened, NonCryptographicRng};
 
 pub use self::receive::StreamRx;
 pub use self::send::StreamTx;
 
 mod receive;
-mod register;
-mod register_nack;
+pub(crate) mod register;
+pub(crate) mod register_nack;
 mod rtx_cache;
 pub(crate) mod rtx_cache_buf;
 mod send;
@@ -116,10 +116,6 @@ impl RtpPacket {
             timestamp: already_happened(),
         }
     }
-
-    pub(crate) fn is_pt_set(&self) -> bool {
-        self.header.payload_type != BLANK_PACKET_DEFAULT_PT
-    }
 }
 
 /// Holder of incoming/outgoing encoded streams.
@@ -145,6 +141,10 @@ pub(crate) struct Streams {
     /// We need to report all RR/SR for a Mid together in one RTCP. This is a dynamic
     /// list that we don't want to allocate on every handle_timeout.
     mids_to_report: Vec<Mid>,
+
+    /// Whether nack reports are enabled. This is an optimization to avoid too frequent
+    /// Session::nack_at() when we don't need to send nacks.
+    any_nack_active: Option<bool>,
 }
 
 impl Default for Streams {
@@ -155,6 +155,7 @@ impl Default for Streams {
             streams_tx: Default::default(),
             default_ssrc_tx: 0.into(), // this will be changed
             mids_to_report: Vec::with_capacity(10),
+            any_nack_active: None,
         }
     }
 }
@@ -279,6 +280,9 @@ impl Streams {
         suppress_nack: bool,
         reason: Option<&str>,
     ) -> &mut StreamRx {
+        // New stream might have enabled nacks.
+        self.any_nack_active = None;
+
         let stream = self
             .streams_rx
             .entry(ssrc)
@@ -497,7 +501,7 @@ impl Streams {
 
     pub(crate) fn new_ssrc(&self) -> Ssrc {
         loop {
-            let ssrc: Ssrc = (rand::random::<u32>()).into();
+            let ssrc: Ssrc = (NonCryptographicRng::u32()).into();
 
             let has_ssrc = self.has_stream_rx(ssrc) || self.has_stream_tx(ssrc);
 
@@ -568,6 +572,10 @@ impl Streams {
         mid: Mid,
         rid: Option<Rid>,
     ) -> Option<&mut StreamRx> {
+        // Invalidate nack_active since it's possible to manipulate the
+        // nack setting on the returned StreamRx.
+        self.any_nack_active = None;
+
         self.streams_rx
             .values_mut()
             .find(|s| s.mid() == mid && (rid.is_none() || s.rid() == rid))
@@ -625,7 +633,10 @@ impl Streams {
         }
     }
 
-    pub(crate) fn change_stream_rx_rtx(&mut self, rtx_from: Ssrc, rtx_to: Ssrc) {
+    fn change_stream_rx_rtx(&mut self, rtx_from: Ssrc, rtx_to: Ssrc) {
+        // Invalidate since we might need to enable nacks now.
+        self.any_nack_active = None;
+
         // Remove the SSRC mapping
         self.source_keys_rx.remove(&rtx_from);
 
@@ -654,6 +665,13 @@ impl Streams {
 
     fn associate_ssrc_mid(&mut self, ssrc: Ssrc, mid: Mid, ssrc_main: Ssrc, reason: Option<&str>) {
         associate_ssrc_mid(&mut self.source_keys_rx, ssrc, mid, ssrc_main, reason);
+    }
+
+    pub(crate) fn any_nack_enabled(&mut self) -> bool {
+        if self.any_nack_active.is_none() {
+            self.any_nack_active = Some(self.streams_rx.values().any(|s| s.nack_enabled()));
+        }
+        self.any_nack_active.unwrap()
     }
 }
 

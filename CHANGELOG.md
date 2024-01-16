@@ -1,4 +1,8 @@
 # Unreleased
+  * Speed up twcc register updates using max_seq()
+  * Parse `StunMessage` without allocations (and huge STUN parsing cleanup)
+  * Introduce top-level `ice` module having `ice::IceAgent` for standalone usage
+  * Remove `StunError::Other` because it was unused
   * Optional parser for VLA (Video Layers Allocation) RTP header extension
   * Chat example send PLI on RTC sequence interruption
   * Improved VP9 support with parsing layer metadata
