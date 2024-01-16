@@ -224,6 +224,8 @@ impl Depacketizer for H264Depacketizer {
             return Err(PacketError::ErrShortPacket);
         }
 
+        println!("depacketize > packet {:?}", packet);
+
         // NALU Types
         // https://tools.ietf.org/html/rfc6184#section-5.4
         let b0 = packet[0];
